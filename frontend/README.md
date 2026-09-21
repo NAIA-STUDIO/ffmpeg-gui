@@ -54,3 +54,22 @@ Esto hace, en orden:
 El resultado es un `.exe` que **no requiere Python instalado en la máquina del usuario** — solo `ffmpeg`/`ffprobe` en el `PATH`, igual que la GUI PyQt6 original.
 
 > Nota (Windows sin modo desarrollador): si `electron-builder` falla al descargar `winCodeSign` con un error de "no se puede crear el enlace simbólico", es porque esa dependencia incluye símlinks de macOS que Windows no puede extraer sin privilegios de administrador o el Modo de Desarrollador activado (Configuración → Privacidad y seguridad → Para desarrolladores). Solo afecta la primera descarga; una vez está en caché (`%LOCALAPPDATA%\electron-builder\Cache`) no vuelve a ocurrir.
+
+## Actualizaciones automáticas y publicación de versiones
+
+La app instalada se actualiza sola desde las [Releases de GitHub](https://github.com/NAIA-STUDIO/ffmpeg-gui/releases) (`electron-updater`, configurado en `publish` de `electron-builder.json5`). Al arrancar comprueba la última release, la descarga en segundo plano y muestra un aviso con **Reiniciar y actualizar**; si se ignora, se instala sola al cerrar la app. El título de la ventana muestra la versión instalada.
+
+Para publicar una versión nueva:
+
+```bash
+npm version 1.0.3 --no-git-tag-version   # sube la versión (package.json y package-lock.json)
+npm run build                            # genera release/1.0.3/
+git commit -am "..." && git push
+gh release create v1.0.3 --target <sha-completo-del-commit> --title "FFmpeg GUI 1.0.3" --notes "..." \
+  release/1.0.3/FFmpeg-GUI-Windows-1.0.3-Setup.exe \
+  release/1.0.3/FFmpeg-GUI-Windows-1.0.3-Setup.exe.blockmap \
+  release/1.0.3/latest.yml
+```
+
+- Los **tres archivos** son necesarios: `latest.yml` es lo que consulta la app para saber si hay versión nueva, y el `.blockmap` permite descargas diferenciales (solo las partes que cambian) a partir de la segunda actualización.
+- La versión **debe ser mayor** que la publicada; la app ignora releases marcadas como *draft* o *pre-release*.

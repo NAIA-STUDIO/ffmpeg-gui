@@ -44,8 +44,8 @@
   "publish": [
     {
       "provider": "github",
-      "owner": "robertofdzb10",
-      "repo": "ffmpeg-interfaz"
+      "owner": "NAIA-STUDIO",
+      "repo": "ffmpeg-gui"
     }
   ],
   "nsis": {
