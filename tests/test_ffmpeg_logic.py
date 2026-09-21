@@ -210,5 +210,83 @@ class PairVideosByResolutionTests(unittest.TestCase):
             self.assertEqual(len(ignored_2), 1)
 
 
+def _info(stream_types=("video", "audio"), width=1080, height=1920, frame_rate="30/1", audio=True, duration=10.0):
+    return {
+        "stream_types": list(stream_types),
+        "video": {"codec": "h264", "width": width, "height": height, "pix_fmt": "yuv420p",
+                  "frame_rate": frame_rate, "fps": 30.0, "time_base": "1/30000"},
+        "audio": {"codec": "aac", "sample_rate": "48000", "channels": 2} if audio else None,
+        "duration": duration,
+    }
+
+
+class CheckFastMergeCompatibilityTests(unittest.TestCase):
+    def test_identical_videos_are_compatible(self):
+        ok, reason = logic.check_fast_merge_compatibility([_info(), _info(duration=3)])
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+
+    def test_missing_audio_or_different_track_order_is_incompatible(self):
+        # Caso real: vídeo sin audio + vídeo con el audio como primera pista
+        infos = [_info(stream_types=["video"], audio=False), _info(stream_types=["audio", "video"])]
+        ok, _ = logic.check_fast_merge_compatibility(infos)
+        self.assertFalse(ok)
+
+    def test_different_resolution_is_incompatible(self):
+        ok, _ = logic.check_fast_merge_compatibility([_info(), _info(width=1080, height=1080)])
+        self.assertFalse(ok)
+
+
+class MergeVideosCommandTests(unittest.TestCase):
+    def _merge(self, infos, mode):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for i in range(len(infos)):
+                path = os.path.join(tmp, f"v{i}.mp4")
+                open(path, "w").close()
+                paths.append(path)
+            with patch.object(logic, "probe_video", side_effect=infos):
+                command, output_file, concat_file, error, details = logic.merge_videos_command(
+                    paths, mode=mode, output_dir=tmp
+                )
+            if concat_file and os.path.exists(concat_file):
+                os.remove(concat_file)
+            return command, error, details
+
+    def test_fast_mode_uses_stream_copy_when_compatible(self):
+        command, error, details = self._merge([_info(), _info()], "fast")
+        self.assertEqual(error, "")
+        self.assertEqual(details["mode"], "fast")
+        self.assertIn("copy", command)
+
+    def test_fast_mode_falls_back_to_compatible_when_tracks_differ(self):
+        infos = [_info(stream_types=["video"], audio=False, duration=162.8),
+                 _info(stream_types=["audio", "video"], duration=17.1)]
+        command, error, details = self._merge(infos, "fast")
+        self.assertEqual(details["mode"], "compatible")
+        self.assertTrue(details["notice"])
+        filter_complex = command[command.index("-filter_complex") + 1]
+        # Silencio para el clip sin audio y concat de los dos segmentos con audio
+        self.assertIn("anullsrc", filter_complex)
+        self.assertIn("atrim=duration=162.8", filter_complex)
+        self.assertIn("concat=n=2:v=1:a=1", filter_complex)
+        self.assertEqual(details["total_frames"], int((162.8 + 17.1) * 30))
+
+    def test_compatible_without_any_audio_outputs_video_only(self):
+        infos = [_info(stream_types=["video"], audio=False), _info(stream_types=["video"], audio=False, width=640, height=360)]
+        command, error, details = self._merge(infos, "compatible")
+        filter_complex = command[command.index("-filter_complex") + 1]
+        self.assertIn("concat=n=2:v=1:a=0", filter_complex)
+        self.assertIn("scale=1080:1920", filter_complex)
+        self.assertNotIn("-c:a", command)
+
+    def test_file_without_video_is_rejected(self):
+        info = _info()
+        info["video"] = None
+        command, error, _ = self._merge([info, _info()], "compatible")
+        self.assertEqual(command, [])
+        self.assertIn("no tiene pista de vídeo", error)
+
+
 if __name__ == "__main__":
     unittest.main()

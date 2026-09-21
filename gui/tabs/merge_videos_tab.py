@@ -407,7 +407,7 @@ class MergeVideosTab(QWidget):
         mode = "fast" if mode_text == "Rápido (sin recodificar)" else "compatible"
 
         try:
-            command, output_file, concat_file, error_message = merge_videos_command(
+            command, output_file, concat_file, error_message, details = merge_videos_command(
                 self.input_videos,
                 mode=mode,
                 output_name=self.output_name_input.text().strip(),
@@ -428,8 +428,8 @@ class MergeVideosTab(QWidget):
             self.tasks_layout.addWidget(error_widget)
             return
 
-        task_prefix = "Unión rápida: " if mode_text == "Rápido (sin recodificar)" else "Unión compatible: "
-        self.start_merge_task(command, output_file, concat_file, task_prefix)
+        task_prefix = "Unión rápida: " if details["mode"] == "fast" else "Unión compatible: "
+        self.start_merge_task(command, output_file, concat_file, task_prefix, details)
 
     # =========================================================
     # Procesado automático por carpetas
@@ -497,7 +497,7 @@ class MergeVideosTab(QWidget):
         for pair_info in pairs:
             output_name = os.path.splitext(os.path.basename(pair_info["video_1"]))[0]
 
-            command, output_file, concat_file, error_message = merge_videos_command(
+            command, output_file, concat_file, error_message, details = merge_videos_command(
                 [pair_info["video_1"], pair_info["video_2"]],
                 mode=mode,
                 output_name=output_name,
@@ -515,12 +515,12 @@ class MergeVideosTab(QWidget):
 
             variant_suffix = " sin logo" if pair_info["variant"] == "sin_logo" else ""
             task_prefix = f"Auto {pair_info['resolution']}{variant_suffix}: "
-            self.start_merge_task(command, output_file, concat_file, task_prefix)
+            self.start_merge_task(command, output_file, concat_file, task_prefix, details)
 
     # =========================================================
     # Arranque común de tareas
     # =========================================================
-    def start_merge_task(self, command, output_file, concat_file, task_prefix):
+    def start_merge_task(self, command, output_file, concat_file, task_prefix, details):
         """
         Crea el widget de tarea y lanza un FFmpegWorker.
         """
@@ -528,13 +528,19 @@ class MergeVideosTab(QWidget):
         task_widget = ConversionTaskWidget(task_name)
         self.tasks_layout.addWidget(task_widget)
 
-        worker = FFmpegWorker(command, total_frames=100, output_file=output_file, enable_logs=False)
+        if details.get("notice"):
+            # El modo rápido no era viable: se avisa y se explica el motivo en el tooltip
+            task_widget.update_status("En progreso (recodificando)")
+            task_widget.status_label.setToolTip(details["notice"])
+
+        total_frames = details.get("total_frames") or 100
+        worker = FFmpegWorker(command, total_frames=total_frames, output_file=output_file, enable_logs=False)
         self.active_workers.append(worker)
 
         worker.progressChanged.connect(lambda value: task_widget.update_progress(value))
         worker.finishedSignal.connect(
             lambda success, message: self.handle_merge_task_finished(
-                task_widget, success, message, concat_file, worker, task_prefix
+                task_widget, success, message, concat_file, worker, task_prefix, details.get("notice", "")
             )
         )
         task_widget.cancelRequested.connect(
@@ -543,7 +549,7 @@ class MergeVideosTab(QWidget):
 
         worker.start()
 
-    def handle_merge_task_finished(self, task_widget, success, message, concat_file, worker, task_prefix):
+    def handle_merge_task_finished(self, task_widget, success, message, concat_file, worker, task_prefix, notice=""):
         """
         Actualiza el widget de tarea al finalizar y limpia archivo temporal.
         """
@@ -551,7 +557,7 @@ class MergeVideosTab(QWidget):
         self.remove_worker_reference(worker)
 
         if success:
-            task_widget.update_status("Completado")
+            task_widget.update_status("Completado (recodificado)" if notice else "Completado")
             task_widget.update_progress(100)
 
             if message and os.path.exists(message):

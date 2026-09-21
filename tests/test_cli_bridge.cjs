@@ -82,6 +82,11 @@ function runOperation(python, operation, params, { cancelAfterMs } = {}) {
   })
 }
 
+function probeDuration(file) {
+  const output = execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file])
+  return parseFloat(output.toString().trim())
+}
+
 function finalResult(events) {
   return events.find((e) => e.type === 'result')
 }
@@ -114,6 +119,9 @@ function makeFixtures(dir) {
   run(['-y', '-f', 'lavfi', '-i', 'testsrc=duration=8:size=640x480:rate=30', '-c:v', 'libx264', '-preset', 'ultrafast', p('long.mp4')])
   run(['-y', '-f', 'lavfi', '-i', 'testsrc=duration=2:size=320x240:rate=25', '-c:v', 'libx264', p('silent.mp4')])
   run(['-y', '-f', 'lavfi', '-i', 'sine=frequency=220:duration=2', p('audio.mp3')])
+  // Mismo caso que los vídeos 1080x1920 de campaña: un clip con audio como primera pista
+  // y vídeo como segunda (se unía detrás de silent.mp4 y el resultado salía recortado).
+  run(['-y', '-f', 'lavfi', '-i', 'testsrc=duration=3:size=320x240:rate=25', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=3', '-map', '1:a', '-map', '0:v', '-c:v', 'libx264', '-c:a', 'aac', p('audio_first.mp4')])
   for (const i of [1, 2, 3, 4, 5]) {
     run(['-y', '-f', 'lavfi', '-i', 'color=c=blue:size=64x64:d=1', '-frames:v', '1', p('imgseq', `seq_0${i}.png`)])
   }
@@ -192,6 +200,14 @@ async function main() {
     results.push(await test('merge_videos (compatible)', async () => {
       const events = await runOperation(python, 'merge_videos', { videos: [p('test.mp4'), p('test.mp4')], mode: 'compatible', preset: 'ultrafast', crf: '30', format: 'mp4' })
       assert(finalResult(events)?.success, 'expected success')
+    }))
+
+    results.push(await test('merge_videos (fast) with different tracks keeps full duration', async () => {
+      const events = await runOperation(python, 'merge_videos', { videos: [p('silent.mp4'), p('audio_first.mp4')], mode: 'fast', preset: 'ultrafast', format: 'mp4' })
+      const result = finalResult(events)
+      assert(result?.success, `expected success, got ${JSON.stringify(result)}`)
+      const duration = probeDuration(result.output)
+      assert(Math.abs(duration - 5) < 0.2, `expected ~5s (2s + 3s), got ${duration}s`)
     }))
 
     results.push(await test('merge_auto (folder pairing)', async () => {

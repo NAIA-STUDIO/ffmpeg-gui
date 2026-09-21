@@ -11,6 +11,8 @@ Módulo que contiene funciones para construir comandos FFmpeg para diversas oper
 
 import os
 import re
+import sys
+import json
 import time
 import tempfile
 import subprocess
@@ -104,6 +106,182 @@ def get_video_duration(video_path):
     except Exception as e:
         print("Error obteniendo duración del vídeo:", e)
         return 0.0
+
+
+def _subprocess_flags():
+    """
+    En Windows evita que se abra una consola al lanzar ffprobe desde el .exe.
+    """
+    return 0x08000000 if sys.platform.startswith("win") else 0
+
+
+def _parse_frame_rate(rate):
+    """
+    Convierte '30000/1001' o '30' en float. Devuelve 0.0 si no es válido.
+    """
+    try:
+        if "/" in str(rate):
+            num, den = str(rate).split("/", 1)
+            den = float(den)
+            return float(num) / den if den else 0.0
+        return float(rate)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def probe_video(video_path):
+    """
+    Obtiene con ffprobe la información necesaria para unir vídeos.
+
+    Retorna un dict con:
+        stream_types: tipos de pista en orden, p.ej. ['video', 'audio']
+        video: dict con codec, width, height, pix_fmt, fps, time_base (o None)
+        audio: dict con codec, sample_rate, channels (o None)
+        duration: duración en segundos
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries",
+        "format=duration:stream=index,codec_type,codec_name,width,height,pix_fmt,"
+        "avg_frame_rate,r_frame_rate,time_base,sample_rate,channels,duration",
+        "-of", "json",
+        video_path
+    ]
+    output = subprocess.check_output(
+        cmd, universal_newlines=True, encoding="utf-8", creationflags=_subprocess_flags()
+    )
+    data = json.loads(output)
+    streams = data.get("streams", [])
+
+    video = None
+    audio = None
+    video_duration = None
+    for stream in streams:
+        codec_type = stream.get("codec_type")
+        if codec_type == "video" and video is None:
+            # Se usa la tasa nominal (r_frame_rate) como fracción para no acumular desfase
+            # con tasas como 30000/1001; si es anómala se recurre a la media.
+            frame_rate = stream.get("r_frame_rate")
+            fps = _parse_frame_rate(frame_rate)
+            if not 0 < fps <= 120:
+                fps = _parse_frame_rate(stream.get("avg_frame_rate"))
+                frame_rate = str(round(fps, 3)) if fps > 0 else "30"
+            video = {
+                "codec": stream.get("codec_name"),
+                "width": stream.get("width"),
+                "height": stream.get("height"),
+                "pix_fmt": stream.get("pix_fmt"),
+                "frame_rate": frame_rate,
+                "fps": fps or 30.0,
+                "time_base": stream.get("time_base"),
+            }
+            video_duration = stream.get("duration")
+        elif codec_type == "audio" and audio is None:
+            audio = {
+                "codec": stream.get("codec_name"),
+                "sample_rate": stream.get("sample_rate"),
+                "channels": stream.get("channels"),
+            }
+
+    try:
+        duration = float(data.get("format", {}).get("duration") or video_duration or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+
+    return {
+        "stream_types": [s.get("codec_type") for s in streams if s.get("codec_type") in ("video", "audio")],
+        "video": video,
+        "audio": audio,
+        "duration": duration,
+    }
+
+
+def check_fast_merge_compatibility(infos):
+    """
+    Comprueba si una lista de vídeos (resultado de probe_video) se puede unir
+    sin recodificar con el concat demuxer. Para ello todos deben tener exactamente
+    las mismas pistas, en el mismo orden y con los mismos parámetros.
+
+    Retorna (True, "") o (False, motivo).
+    """
+    reference = infos[0]
+    for info in infos[1:]:
+        if info["stream_types"] != reference["stream_types"]:
+            return False, "los vídeos no tienen las mismas pistas (audio/vídeo) o están en distinto orden"
+        if info["video"] != reference["video"]:
+            return False, "los vídeos tienen distinto códec, resolución, formato de píxel o fps"
+        if info["audio"] != reference["audio"]:
+            return False, "los vídeos tienen distinto formato de audio"
+    return True, ""
+
+
+def _even(value):
+    value = int(value or 0)
+    return value - (value % 2)
+
+
+def build_compatible_merge_command(video_paths, infos, output_file, preset="slow", crf="19"):
+    """
+    Une N vídeos recodificando con el filtro concat, que funciona aunque los vídeos
+    tengan distinta resolución, fps, formato de píxel, orden de pistas o les falte audio:
+    - Todos se escalan (sin deformar, con bandas negras si hace falta) a la resolución
+      y fps del primer vídeo.
+    - Si algún vídeo tiene audio, a los que no lo tengan se les añade silencio de su
+      misma duración. Si ninguno tiene audio, la salida no lleva audio.
+    """
+    reference = infos[0]["video"]
+    width = _even(reference["width"])
+    height = _even(reference["height"])
+    fps = reference["frame_rate"]
+
+    with_audio = any(info["audio"] for info in infos)
+
+    command = ["ffmpeg", "-y"]
+    for path in video_paths:
+        command.extend(["-i", path])
+
+    filters = []
+    concat_inputs = ""
+    for i, info in enumerate(infos):
+        filters.append(
+            f"[{i}:v:0]scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p,"
+            f"setpts=PTS-STARTPTS[v{i}]"
+        )
+        concat_inputs += f"[v{i}]"
+
+        if with_audio:
+            if info["audio"]:
+                source = f"[{i}:a:0]"
+            else:
+                # Silencio con la duración del clip para que el audio no se desincronice
+                source = f"anullsrc=r=48000:cl=stereo,atrim=duration={max(info['duration'], 0.1)},"
+            filters.append(
+                f"{source}aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                f"aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a{i}]"
+            )
+            concat_inputs += f"[a{i}]"
+
+    audio_flag = 1 if with_audio else 0
+    output_labels = "[v][a]" if with_audio else "[v]"
+    filters.append(f"{concat_inputs}concat=n={len(infos)}:v=1:a={audio_flag}{output_labels}")
+
+    command.extend(["-filter_complex", ";".join(filters), "-map", "[v]"])
+    if with_audio:
+        command.extend(["-map", "[a]"])
+
+    command.extend([
+        "-c:v", "libx264",
+        "-preset", str(preset),
+        "-crf", str(crf),
+        "-pix_fmt", "yuv420p",
+    ])
+    if with_audio:
+        command.extend(["-c:a", "aac", "-b:a", "192k"])
+    command.extend(["-movflags", "+faststart", output_file])
+
+    return command
 
 
 def get_video_resolution(video_path):
@@ -669,15 +847,40 @@ def merge_videos_command(video_paths, mode="fast", output_name=None, preset="slo
         output_format: formato de salida
         output_dir: directorio de salida opcional. Si es None, usa la carpeta del primer vídeo.
 
+    El modo 'fast' (sin recodificar) sólo es fiable si todos los vídeos tienen
+    exactamente las mismas pistas y parámetros. Si no es así, se usa automáticamente
+    el modo compatible, porque el concat demuxer mezclaría las pistas y el resultado
+    saldría recortado o corrupto.
+
     Retorna:
-        (command, output_file, concat_file, error_message)
+        (command, output_file, concat_file, error_message, details)
+        details = {"mode": modo usado, "notice": aviso para el usuario, "total_frames": estimación}
     """
+    details = {"mode": mode, "notice": "", "total_frames": 0}
+
     is_valid, error_message = validate_merge_inputs(video_paths)
     if not is_valid:
-        return [], "", "", error_message
+        return [], "", "", error_message, details
 
     if mode not in {"fast", "compatible"}:
-        return [], "", "", f"Modo de unión no válido: {mode}"
+        return [], "", "", f"Modo de unión no válido: {mode}", details
+
+    infos = []
+    for path in video_paths:
+        try:
+            info = probe_video(path)
+        except Exception as e:
+            return [], "", "", f"No se pudo analizar el vídeo {os.path.basename(path)}: {e}", details
+        if not info["video"]:
+            return [], "", "", f"El archivo no tiene pista de vídeo: {os.path.basename(path)}", details
+        infos.append(info)
+
+    if mode == "fast":
+        compatible, reason = check_fast_merge_compatibility(infos)
+        if not compatible:
+            mode = "compatible"
+            details["mode"] = mode
+            details["notice"] = f"Se ha recodificado porque {reason}."
 
     first_video = os.path.abspath(video_paths[0])
     base_dir = output_dir if output_dir else os.path.dirname(first_video)
@@ -685,7 +888,7 @@ def merge_videos_command(video_paths, mode="fast", output_name=None, preset="slo
     try:
         os.makedirs(base_dir, exist_ok=True)
     except Exception as e:
-        return [], "", "", f"No se pudo crear el directorio de salida: {e}"
+        return [], "", "", f"No se pudo crear el directorio de salida: {e}", details
 
     if output_name and str(output_name).strip():
         filename = f"{str(output_name).strip()}.{output_format}"
@@ -696,34 +899,24 @@ def merge_videos_command(video_paths, mode="fast", output_name=None, preset="slo
     output_file = os.path.join(base_dir, filename)
     output_file = get_unique_filename(output_file)
 
-    concat_file = build_concat_file(video_paths)
+    details["total_frames"] = int(sum(info["duration"] for info in infos) * infos[0]["video"]["fps"])
 
     if mode == "fast":
+        concat_file = build_concat_file(video_paths)
         command = [
             "ffmpeg",
             "-y",
             "-f", "concat",
             "-safe", "0",
             "-i", concat_file,
+            "-map", "0",
             "-c", "copy",
-            output_file
-        ]
-    else:
-        command = [
-            "ffmpeg",
-            "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", concat_file,
-            "-c:v", "libx264",
-            "-preset", str(preset),
-            "-crf", str(crf),
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "192k",
             "-movflags", "+faststart",
             output_file
         ]
+    else:
+        concat_file = ""
+        command = build_compatible_merge_command(video_paths, infos, output_file, preset=preset, crf=crf)
 
     print(" ".join(command))
-    return command, output_file, concat_file, ""
+    return command, output_file, concat_file, "", details

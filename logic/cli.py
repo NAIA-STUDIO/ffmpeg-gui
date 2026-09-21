@@ -296,7 +296,7 @@ def op_crop_video(params, watcher):
 
 def op_merge_videos(params, watcher):
     videos = params["videos"]
-    command, output_file, concat_file, error_message = logic.merge_videos_command(
+    command, output_file, concat_file, error_message, details = logic.merge_videos_command(
         videos,
         mode=params.get("mode", "fast"),
         output_name=params.get("outputName") or None,
@@ -307,7 +307,7 @@ def op_merge_videos(params, watcher):
     if not command:
         return {"success": False, "error": error_message or "Error al construir el comando FFmpeg."}
 
-    total_frames = estimate_total_frames(videos[0]) if videos else 100
+    total_frames = details["total_frames"] or 100
     try:
         success, error = run_ffmpeg(command, output_file, total_frames, watcher)
     finally:
@@ -350,7 +350,7 @@ def op_merge_auto(params, watcher):
         variant_suffix = " sin logo" if pair_info["variant"] == "sin_logo" else ""
         label = f"Auto {pair_info['resolution']}{variant_suffix}: {output_name}"
 
-        command, output_file, concat_file, error_message = logic.merge_videos_command(
+        command, output_file, concat_file, error_message, details = logic.merge_videos_command(
             [pair_info["video_1"], pair_info["video_2"]],
             mode=mode,
             output_name=output_name,
@@ -367,7 +367,7 @@ def op_merge_auto(params, watcher):
             emit({"type": "pair_done", "success": False, "output": None, "error": error_message, **prefix})
             continue
 
-        total_frames = estimate_total_frames(pair_info["video_1"])
+        total_frames = details["total_frames"] or 100
         try:
             success, error = run_ffmpeg(command, output_file, total_frames, watcher, progress_prefix=prefix)
         finally:
