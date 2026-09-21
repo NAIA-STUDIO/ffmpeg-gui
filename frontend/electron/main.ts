@@ -3,6 +3,11 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
+// electron-updater es CommonJS: desde ESM hay que importar el paquete por
+// defecto y sacar autoUpdater de ahí (import con nombre falla en runtime).
+import electronUpdater from 'electron-updater'
+
+const { autoUpdater } = electronUpdater
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -162,6 +167,41 @@ function registerIpcHandlers() {
   ipcMain.handle('dependencies:check', () => {
     return checkDependencies()
   })
+
+  ipcMain.handle('update:getDownloaded', () => downloadedUpdateVersion)
+
+  ipcMain.handle('update:install', () => {
+    // isSilent=true: sin asistente de NSIS, solo reinstala y reabre la app.
+    autoUpdater.quitAndInstall(true, true)
+  })
+}
+
+// Actualizaciones automáticas desde GitHub Releases (configurado en
+// electron-builder.json5 > publish). Solo en la app instalada: en desarrollo
+// no hay app-update.yml y no tiene sentido. La descarga ocurre en segundo
+// plano; si el usuario no pulsa "Reiniciar" en el aviso, la actualización se
+// instala sola al cerrar la app (autoInstallOnAppQuit).
+let downloadedUpdateVersion: string | null = null
+
+function setupAutoUpdates() {
+  if (!app.isPackaged) return
+
+  autoUpdater.autoDownload = true
+  autoUpdater.autoInstallOnAppQuit = true
+
+  autoUpdater.on('update-downloaded', (info) => {
+    downloadedUpdateVersion = info.version
+    win?.webContents.send('update:downloaded', info.version)
+  })
+  autoUpdater.on('error', (err) => {
+    // Sin conexión, GitHub caído, etc.: no debe molestar al usuario, la app
+    // sigue funcionando igual y lo reintentará en el próximo arranque.
+    console.error('Error comprobando actualizaciones:', err)
+  })
+
+  autoUpdater.checkForUpdates().catch((err) => {
+    console.error('Error comprobando actualizaciones:', err)
+  })
 }
 
 function isOnPath(command: string): boolean {
@@ -211,8 +251,10 @@ function createAppMenu() {
 }
 
 function createWindow() {
+  // La versión en el título permite comprobar de un vistazo si ya se aplicó
+  // una actualización.
   win = new BrowserWindow({
-    title: 'FFmpeg GUI',
+    title: `FFmpeg GUI ${app.getVersion()}`,
     icon: path.join(process.env.VITE_PUBLIC, 'logo.png'),
     // Evita el flash de fondo blanco al arrancar mientras carga una app con
     // tema oscuro: sin esto, Electron pinta la ventana en blanco por defecto
@@ -234,6 +276,9 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.mjs'),
     },
   })
+
+  // Sin esto el <title> de index.html sustituye al título con la versión.
+  win.on('page-title-updated', (event) => event.preventDefault())
 
   if (VITE_DEV_SERVER_URL) {
     win.loadURL(VITE_DEV_SERVER_URL)
@@ -265,4 +310,5 @@ app.whenReady().then(() => {
   createAppMenu()
   registerIpcHandlers()
   createWindow()
+  setupAutoUpdates()
 })

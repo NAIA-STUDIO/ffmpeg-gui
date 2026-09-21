@@ -58,6 +58,19 @@ const api = {
   checkDependencies(): Promise<{ ffmpeg: boolean; ffprobe: boolean }> {
     return ipcRenderer.invoke('dependencies:check')
   },
+  getDownloadedUpdate(): Promise<string | null> {
+    return ipcRenderer.invoke('update:getDownloaded')
+  },
+  onUpdateDownloaded(callback: (version: string) => void) {
+    const listener = (_event: Electron.IpcRendererEvent, version: string) => callback(version)
+    ipcRenderer.on('update:downloaded', listener)
+    return () => {
+      ipcRenderer.removeListener('update:downloaded', listener)
+    }
+  },
+  installUpdate(): Promise<void> {
+    return ipcRenderer.invoke('update:install')
+  },
   getPathForFile(file: File): string {
     // Electron dejó de exponer `File.path` (ver dragDrop.ts); esta es la
     // sustitución oficial, disponible en el proceso de preload/renderer.

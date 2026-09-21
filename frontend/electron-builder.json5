@@ -33,8 +33,21 @@
         ]
       }
     ],
-    "artifactName": "${productName}-Windows-${version}-Setup.${ext}"
+    // Sin espacios: GitHub cambia los espacios de los assets por puntos y
+    // latest.yml dejaría de apuntar al instalador correcto.
+    "artifactName": "FFmpeg-GUI-Windows-${version}-Setup.${ext}"
   },
+  // Actualizaciones automáticas (electron-updater): la app instalada consulta
+  // la última Release de este repositorio. Cada release debe llevar el
+  // instalador, su .blockmap y latest.yml (los genera `npm run build` en
+  // release/<versión>/).
+  "publish": [
+    {
+      "provider": "github",
+      "owner": "robertofdzb10",
+      "repo": "ffmpeg-interfaz"
+    }
+  ],
   "nsis": {
     "oneClick": false,
     "perMachine": false,
